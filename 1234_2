@@ -1,0 +1,282 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.ar_model import AutoReg
+from statsmodels.tsa.holtwinters import ExponentialSmoothing, SimpleExpSmoothing
+
+try:
+    from prophet import Prophet
+except Exception:
+    Prophet = None
+
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
+
+# -------------------- CONFIG --------------------
+DATA_PATH = "sales.csv"
+OUTPUT_DIR = "outputs"
+VALIDATION_MONTHS = 6
+FORECAST_HORIZON = 12  # прогноз на следующий год
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# -------------------- HELPERS --------------------
+def evaluate_forecast(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mape = np.mean(np.abs((y_true - y_pred) / np.where(y_true == 0, np.nan, y_true))) * 100
+    return {"MAE": mae, "RMSE": rmse, "MAPE": mape}
+
+def build_features(df):
+    df = df.copy()
+    df['lag1'] = df['sales'].shift(1)
+    df['lag2'] = df['sales'].shift(2)
+    df['lag3'] = df['sales'].shift(3)
+    df['rolling3'] = df['sales'].rolling(3).mean().shift(1)
+    df['month'] = df['date'].dt.month
+    return df.dropna()
+
+def safe_numeric(df):
+    return df.select_dtypes(include=[np.number, bool])
+
+# -------------------- MODEL EVALUATION --------------------
+def model_evaluation(train, val=None, model_type="linear", forecast_horizon=None):
+    tr = build_features(train)
+    X_train = safe_numeric(tr.drop(columns=['date','sales'], errors='ignore'))
+    y_train = tr['sales']
+
+    # Для валидации создаём X_val, y_val
+    if val is not None:
+        val_concat = pd.concat([train.tail(12), val], ignore_index=True)
+        val_feat = build_features(val_concat)
+        X_val = safe_numeric(val_feat[val_feat['date'].isin(val['date'])].drop(columns=['date','sales'], errors='ignore'))
+        y_val = val['sales'].values
+    else:
+        X_val, y_val = None, None
+
+    # ------------------ ML модели ------------------
+    if model_type=="linear":
+        model = LinearRegression()
+    elif model_type=="tree":
+        model = DecisionTreeRegressor()
+    elif model_type=="random_forest":
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+    elif model_type=="xgboost" and xgb is not None:
+        model = xgb.XGBRegressor(n_jobs=1, verbosity=0)
+    elif model_type=="knn":
+        model = KNeighborsRegressor(n_neighbors=3)
+
+    # ------------------ Статистические модели ------------------
+    elif model_type=="sarimax":
+        model = SARIMAX(train['sales'], order=(1,1,1), seasonal_order=(1,1,1,12),
+                        enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+        preds = model.forecast(steps=forecast_horizon if forecast_horizon else len(val))
+        if val is not None:
+            return evaluate_forecast(y_val, preds.values), preds.values
+        return None, preds.values
+
+    elif model_type=="autoreg":
+        model = AutoReg(train['sales'], lags=3, old_names=False).fit()
+        steps = forecast_horizon if forecast_horizon else len(val)
+        preds = model.predict(start=len(train), end=len(train)+steps-1)
+        if val is not None:
+            return evaluate_forecast(y_val, preds.values), preds.values
+        return None, preds.values
+
+    elif model_type=="prophet" and Prophet is not None:
+        df_train = train.rename(columns={'date':'ds','sales':'y'})
+        m = Prophet(yearly_seasonality=True).fit(df_train)
+        if val is not None:
+            df_val = val.rename(columns={'date':'ds','sales':'y'})
+            forecast = m.predict(df_val[['ds']])
+            preds = forecast['yhat'].values
+            return evaluate_forecast(y_val, preds), preds
+        else:
+            future_dates = pd.date_range(train['date'].max() + pd.offsets.MonthBegin(),
+                                         periods=forecast_horizon, freq='MS')
+            future_df = pd.DataFrame({'ds': future_dates})
+            forecast = m.predict(future_df)
+            return None, forecast['yhat'].values
+
+    elif model_type=="holt_winters":
+        model = ExponentialSmoothing(train['sales'], trend='add', seasonal='add', seasonal_periods=12).fit()
+        steps = forecast_horizon if forecast_horizon else len(val)
+        preds = model.forecast(steps)
+        if val is not None:
+            return evaluate_forecast(y_val, preds.values), preds.values
+        return None, preds.values
+
+    elif model_type=="ses":
+        model = SimpleExpSmoothing(train['sales']).fit()
+        steps = forecast_horizon if forecast_horizon else len(val)
+        preds = model.forecast(steps)
+        if val is not None:
+            return evaluate_forecast(y_val, preds.values), preds.values
+        return None, preds.values
+
+    elif model_type=="seasonal_naive":
+        preds = []
+        steps = forecast_horizon if forecast_horizon else len(val)
+        for i in range(steps):
+            idx = len(train) - 12 + i
+            preds.append(train['sales'].iloc[idx] if idx >=0 else train['sales'].iloc[-1])
+        if val is not None:
+            return evaluate_forecast(y_val, np.array(preds)), np.array(preds)
+        return None, np.array(preds)
+
+    else:
+        return f"{model_type} not available", None
+
+    # ------------------ Обучение ML моделей ------------------
+    model.fit(X_train, y_train)
+    if val is not None:
+        preds = model.predict(X_val)
+        return evaluate_forecast(y_val[:len(preds)], preds), preds
+    else:
+        # Прогноз на forecast_horizon
+        last_rows = train.copy()
+        preds = []
+        for i in range(forecast_horizon):
+            feat_row = build_features(last_rows.tail(12))
+            X_pred = safe_numeric(feat_row.drop(columns=['date','sales'], errors='ignore').tail(1))
+            pred = model.predict(X_pred)[0]
+            preds.append(pred)
+            last_rows = pd.concat([last_rows, pd.DataFrame({'date':[last_rows['date'].max()+pd.offsets.MonthBegin()],
+                                                            'sales':[pred]})], ignore_index=True)
+        return None, np.array(preds)
+
+# -------------------- PIPELINE --------------------
+def run_pipeline():
+    df = pd.read_csv(DATA_PATH)
+    df['date'] = pd.to_datetime(df['year'].astype(str) + '-' + df['month'].astype(str) + '-01')
+    df = df.sort_values(['product_code','city','date'])
+    decisions = []
+
+    MODEL_LIST = ["seasonal_naive","sarimax","prophet","linear","tree",
+                  "random_forest","xgboost","knn","holt_winters","ses","autoreg"]
+
+    for product, gdf in df.groupby('product_code'):
+        print(f"\n--- PRODUCT {product} ---")
+        # --- Агрегат ---
+        agg = gdf.groupby('date', as_index=False)['sales'].sum().sort_values('date').reset_index(drop=True)
+        if len(agg) < VALIDATION_MONTHS + 6:
+            continue
+        val_end = agg['date'].max()
+        val_start = val_end - pd.DateOffset(months=VALIDATION_MONTHS-1)
+        train = agg[agg['date'] < val_start].reset_index(drop=True)
+        val = agg[(agg['date'] >= val_start) & (agg['date'] <= val_end)].reset_index(drop=True)
+
+        # Оценка моделей
+        eval_map = {}
+        metrics_map = {}
+        for model_name in MODEL_LIST:
+            ev, _ = model_evaluation(train, val, model_type=model_name)
+            eval_map[model_name] = ev
+            if isinstance(ev, dict):
+                metrics_map[model_name] = ev
+                print(f"Model: {model_name}, Metrics: {ev}")
+
+        # Лучшая модель
+        agg_best = min(
+            [(k, v) for k,v in eval_map.items() if isinstance(v, dict)],
+            key=lambda x: x[1]['MAPE'] if not np.isnan(x[1]['MAPE']) else x[1]['MAE'],
+            default=(None,None)
+        )
+        agg_metrics = agg_best[1] if agg_best[1] else {"MAE": np.inf, "RMSE": np.inf, "MAPE": np.inf}
+        agg_model_name = agg_best[0]
+
+        # --- Города ---
+        city_metrics = []
+        city_models = []
+        for city, cdf in gdf.groupby('city'):
+            cdf = cdf.sort_values('date').reset_index(drop=True)
+            if len(cdf) < VALIDATION_MONTHS + 6:
+                continue
+            val_end = cdf['date'].max()
+            val_start = val_end - pd.DateOffset(months=VALIDATION_MONTHS-1)
+            train = cdf[cdf['date'] < val_start].reset_index(drop=True)
+            val = cdf[(cdf['date'] >= val_start) & (cdf['date'] <= val_end)].reset_index(drop=True)
+            eval_map = {}
+            for model_name in MODEL_LIST:
+                ev, _ = model_evaluation(train, val, model_type=model_name)
+                eval_map[model_name] = ev
+            best = min(
+                [(k, v) for k,v in eval_map.items() if isinstance(v, dict)],
+                key=lambda x: x[1]['MAPE'] if not np.isnan(x[1]['MAPE']) else x[1]['MAE'],
+                default=(None,None)
+            )
+            if best[1]:
+                city_metrics.append(best[1])
+                city_models.append(best[0])
+
+        if city_metrics:
+            by_cities_metrics = {k: np.mean([m[k] for m in city_metrics]) for k in ['MAE','RMSE','MAPE']}
+        else:
+            by_cities_metrics = {"MAE": np.inf, "RMSE": np.inf, "MAPE": np.inf}
+
+        final_strategy = "aggregate" if agg_metrics["MAPE"] <= by_cities_metrics["MAPE"] else "by_cities"
+        decisions.append({
+            "product": product,
+            "agg_model": agg_model_name,
+            "agg_mae": agg_metrics["MAE"],
+            "agg_rmse": agg_metrics["RMSE"],
+            "agg_mape": agg_metrics["MAPE"],
+            "by_cities_models": city_models,
+            "by_cities_mae": by_cities_metrics["MAE"],
+            "by_cities_rmse": by_cities_metrics["RMSE"],
+            "by_cities_mape": by_cities_metrics["MAPE"],
+            "final_strategy": final_strategy
+        })
+
+    if decisions:
+        pd.DataFrame(decisions).to_csv(os.path.join(OUTPUT_DIR, "decisions_summary.csv"), index=False)
+    print("\nSaved decisions_summary.csv with metrics and chosen models to", OUTPUT_DIR)
+
+    # ------------------ Прогноз на следующий год ------------------
+    forecasts = []
+    for product, gdf in df.groupby('product_code'):
+        strategy = next((d['final_strategy'] for d in decisions if d['product']==product), 'aggregate')
+        if strategy=='aggregate':
+            train = gdf.groupby('date', as_index=False)['sales'].sum().sort_values('date')
+            model_name = next((d['agg_model'] for d in decisions if d['product']==product), 'holt_winters')
+            _, preds = model_evaluation(train, val=None, model_type=model_name, forecast_horizon=FORECAST_HORIZON)
+            forecast_dates = pd.date_range(train['date'].max() + pd.offsets.MonthBegin(), periods=FORECAST_HORIZON, freq='MS')
+            forecasts.append(pd.DataFrame({'product_code':[product]*FORECAST_HORIZON,
+                                           'date':forecast_dates,
+                                           'forecast':preds,
+                                           'model':model_name}))
+        else:
+            for city, cdf in gdf.groupby('city'):
+                train = cdf.sort_values('date')
+                # Выбираем модель, которая лучше для города
+                city_model_name = 'holt_winters'  # default
+                for d in decisions:
+                    if d['product']==product and city in gdf['city'].unique():
+                        if d['by_cities_models']:
+                            city_model_name = d['by_cities_models'][0]  # берём первую модель
+                _, preds = model_evaluation(train, val=None, model_type=city_model_name, forecast_horizon=FORECAST_HORIZON)
+                forecast_dates = pd.date_range(train['date'].max() + pd.offsets.MonthBegin(), periods=FORECAST_HORIZON, freq='MS')
+                forecasts.append(pd.DataFrame({'product_code':[product]*FORECAST_HORIZON,
+                                               'city':[city]*FORECAST_HORIZON,
+                                               'date':forecast_dates,
+                                               'forecast':preds,
+                                               'model':city_model_name}))
+
+    if forecasts:
+        pd.concat(forecasts).to_csv(os.path.join(OUTPUT_DIR,"forecasts_next_year.csv"), index=False)
+    print("Saved forecasts_next_year.csv with chosen models and predictions.")
+
+if __name__ == "__main__":
+    run_pipeline()
