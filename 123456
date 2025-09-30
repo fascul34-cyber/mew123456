@@ -1,0 +1,268 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.ar_model import AutoReg
+
+try:
+    from prophet import Prophet
+except Exception:
+    Prophet = None
+
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
+
+# --------------------- CONFIG ---------------------
+DATA_PATH = "sales.csv"  # путь к CSV
+OUTPUT_DIR = "outputs"
+FORECAST_START = pd.to_datetime("2025-09-01")
+FORECAST_HORIZON = 12
+VALIDATION_MONTHS = 6
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --------------------- HELPERS ---------------------
+def evaluate_forecast(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mape = np.mean(np.abs((y_true - y_pred) / np.where(y_true == 0, np.nan, y_true))) * 100
+    return {"MAE": float(mae), "RMSE": float(rmse), "MAPE": float(mape)}
+
+def build_features(df):
+    df_feat = df.copy().reset_index(drop=True)
+    df_feat['lag1'] = df_feat['sales'].shift(1)
+    df_feat['lag2'] = df_feat['sales'].shift(2)
+    df_feat['lag3'] = df_feat['sales'].shift(3)
+    df_feat['rolling3'] = df_feat['sales'].rolling(3).mean().shift(1)
+    df_feat['month'] = df_feat['date'].dt.month
+    df_feat = df_feat.dropna().reset_index(drop=True)
+    return df_feat
+
+def safe_numeric(df):
+    """Оставляет только числовые колонки"""
+    return df.select_dtypes(include=[np.number, bool])
+
+# --------------------- MODEL WRAPPERS (validation) ---------------------
+def seasonal_naive_eval(train, val):
+    preds = []
+    for i in range(len(val)):
+        idx = len(train) - 12 + i
+        if idx >= 0:
+            preds.append(train['sales'].iloc[idx])
+        else:
+            preds.append(train['sales'].iloc[-1])
+    return evaluate_forecast(val['sales'].values, np.array(preds)), np.array(preds)
+
+def sarimax_eval(train, val):
+    try:
+        model = SARIMAX(train['sales'], order=(1,1,1), seasonal_order=(1,1,1,12),
+                        enforce_stationarity=False, enforce_invertibility=False)
+        fit = model.fit(disp=False)
+        preds = fit.forecast(steps=len(val))
+        return evaluate_forecast(val['sales'].values, preds.values), preds.values
+    except Exception as e:
+        return str(e), None
+
+def prophet_eval(train, val):
+    if Prophet is None:
+        return "Prophet not installed", None
+    try:
+        train_df = train[['date','sales']].rename(columns={'date':'ds','sales':'y'})
+        val_df = val[['date','sales']].rename(columns={'date':'ds','sales':'y'})
+        m = Prophet(yearly_seasonality=True)
+        m.fit(train_df)
+        forecast = m.predict(val_df[['ds']])
+        preds = forecast['yhat'].values
+        return evaluate_forecast(val_df['y'].values, preds), preds
+    except Exception as e:
+        return str(e), None
+
+def xgboost_eval(train, val):
+    if xgb is None:
+        return "XGBoost not installed", None
+    try:
+        tr_feat = build_features(train)
+        va_concat = pd.concat([train.tail(12).reset_index(drop=True),
+                               val.reset_index(drop=True)], ignore_index=True)
+        va_feat = build_features(va_concat)
+
+        X_train = safe_numeric(tr_feat.drop(columns=['date','sales'], errors='ignore'))
+        y_train = tr_feat['sales']
+        X_val = safe_numeric(
+            va_feat[va_feat['date'].isin(val['date'])].drop(columns=['date','sales'], errors='ignore')
+        )
+
+        if X_val.shape[0] == 0:
+            return "no validation features", None
+
+        model = xgb.XGBRegressor(n_jobs=1, verbosity=0)
+        model.fit(X_train, y_train)
+        preds = model.predict(X_val)
+        return evaluate_forecast(val['sales'].values[:len(preds)], preds), preds
+    except Exception as e:
+        return str(e), None
+
+def tree_eval(train, val):
+    try:
+        tr_feat = build_features(train)
+        va_concat = pd.concat([train.tail(12).reset_index(drop=True),
+                               val.reset_index(drop=True)], ignore_index=True)
+        va_feat = build_features(va_concat)
+
+        X_train = safe_numeric(tr_feat.drop(columns=['date','sales'], errors='ignore'))
+        y_train = tr_feat['sales']
+        X_val = safe_numeric(
+            va_feat[va_feat['date'].isin(val['date'])].drop(columns=['date','sales'], errors='ignore')
+        )
+        if X_val.shape[0] == 0:
+            return "no validation features", None
+
+        model = DecisionTreeRegressor()
+        model.fit(X_train, y_train)
+        preds = model.predict(X_val)
+        return evaluate_forecast(val['sales'].values[:len(preds)], preds), preds
+    except Exception as e:
+        return str(e), None
+
+def linear_eval(train, val):
+    try:
+        tr_feat = build_features(train)
+        va_concat = pd.concat([train.tail(12).reset_index(drop=True),
+                               val.reset_index(drop=True)], ignore_index=True)
+        va_feat = build_features(va_concat)
+
+        X_train = safe_numeric(tr_feat.drop(columns=['date','sales'], errors='ignore'))
+        y_train = tr_feat['sales']
+        X_val = safe_numeric(
+            va_feat[va_feat['date'].isin(val['date'])].drop(columns=['date','sales'], errors='ignore')
+        )
+        if X_val.shape[0] == 0:
+            return "no validation features", None
+
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        preds = model.predict(X_val)
+        return evaluate_forecast(val['sales'].values[:len(preds)], preds), preds
+    except Exception as e:
+        return str(e), None
+
+def autoreg_eval(train, val):
+    try:
+        model = AutoReg(train['sales'], lags=3, old_names=False).fit()
+        preds = model.predict(start=len(train), end=len(train)+len(val)-1)
+        return evaluate_forecast(val['sales'].values, preds.values), preds.values
+    except Exception as e:
+        return str(e), None
+
+# --------------------- MAIN PIPELINE ---------------------
+def run_pipeline():
+    df = pd.read_csv(DATA_PATH)
+    df['date'] = pd.to_datetime(
+        df['year'].astype(int).astype(str) + '-' + df['month'].astype(int).astype(str) + '-01'
+    )
+    df = df.sort_values(['product_code','city','date'])
+
+    decisions = []
+
+    for product, gdf in df.groupby('product_code'):
+        agg = gdf.groupby('date', as_index=False)['sales'].sum()
+        agg = agg.sort_values('date').reset_index(drop=True)
+
+        if len(agg) < VALIDATION_MONTHS + 6:
+            continue
+
+        val_end = agg['date'].max()
+        val_start = val_end - pd.DateOffset(months=VALIDATION_MONTHS-1)
+        train = agg[agg['date'] < val_start].reset_index(drop=True)
+        val = agg[(agg['date'] >= val_start) & (agg['date'] <= val_end)].reset_index(drop=True)
+
+        eval_map = {}
+        for model_name, fn in [
+            ("seasonal_naive", seasonal_naive_eval),
+            ("sarimax", sarimax_eval),
+            ("prophet", prophet_eval),
+            ("xgboost", xgboost_eval),
+            ("tree", tree_eval),
+            ("linear", linear_eval),
+            ("autoreg", autoreg_eval)
+        ]:
+            ev, _ = fn(train, val)
+            eval_map[model_name] = ev
+
+        agg_best = min(
+            [(k, v) for k,v in eval_map.items() if isinstance(v, dict)],
+            key=lambda x: x[1]['MAPE'] if not np.isnan(x[1]['MAPE']) else x[1]['MAE'],
+            default=(None,None)
+        )
+
+        agg_metrics = agg_best[1] if agg_best[1] else {"MAE": np.inf, "RMSE": np.inf, "MAPE": np.inf}
+
+        # --- города ---
+        city_metrics = []
+        for city, cdf in gdf.groupby('city'):
+            cdf = cdf.sort_values('date').reset_index(drop=True)
+            if len(cdf) < VALIDATION_MONTHS + 6:
+                continue
+            val_end = cdf['date'].max()
+            val_start = val_end - pd.DateOffset(months=VALIDATION_MONTHS-1)
+            train = cdf[cdf['date'] < val_start].reset_index(drop=True)
+            val = cdf[(cdf['date'] >= val_start) & (cdf['date'] <= val_end)].reset_index(drop=True)
+            eval_map = {}
+            for model_name, fn in [
+                ("seasonal_naive", seasonal_naive_eval),
+                ("sarimax", sarimax_eval),
+                ("prophet", prophet_eval),
+                ("xgboost", xgboost_eval),
+                ("tree", tree_eval),
+                ("linear", linear_eval),
+                ("autoreg", autoreg_eval)
+            ]:
+                ev, _ = fn(train, val)
+                eval_map[model_name] = ev
+
+            best = min(
+                [(k, v) for k,v in eval_map.items() if isinstance(v, dict)],
+                key=lambda x: x[1]['MAPE'] if not np.isnan(x[1]['MAPE']) else x[1]['MAE'],
+                default=(None,None)
+            )
+            if best[1]:
+                city_metrics.append(best[1])
+
+        if city_metrics:
+            by_cities_metrics = {
+                "MAE": np.mean([m["MAE"] for m in city_metrics]),
+                "RMSE": np.mean([m["RMSE"] for m in city_metrics]),
+                "MAPE": np.mean([m["MAPE"] for m in city_metrics])
+            }
+        else:
+            by_cities_metrics = {"MAE": np.inf, "RMSE": np.inf, "MAPE": np.inf}
+
+        # --- сравнение стратегий ---
+        final_strategy = "aggregate" if agg_metrics["MAPE"] <= by_cities_metrics["MAPE"] else "by_cities"
+
+        decisions.append({
+            "product": product,
+            "agg_mae": agg_metrics["MAE"],
+            "agg_rmse": agg_metrics["RMSE"],
+            "agg_mape": agg_metrics["MAPE"],
+            "by_cities_mae": by_cities_metrics["MAE"],
+            "by_cities_rmse": by_cities_metrics["RMSE"],
+            "by_cities_mape": by_cities_metrics["MAPE"],
+            "final_strategy": final_strategy
+        })
+
+    if decisions:
+        pd.DataFrame(decisions).to_csv(os.path.join(OUTPUT_DIR, "decisions_summary.csv"), index=False)
+    print("Saved decisions_summary.csv with full metrics to", OUTPUT_DIR)
+
+if __name__ == "__main__":
+    run_pipeline()
